@@ -1,0 +1,17 @@
+{
+  "name": "btfd-1",
+  "version": "1.0.0",
+  "description": "## High-Level Overview You're building a cooperative DCA + leverage system where users set ETH price \"strike points.\" When ETH hits their price, their position converts to 100% ETH and enters a DAO. This ETH is used as collateral on Compound to borrow USDC to buy more ETH, creating leveraged upside exposure. The system generates yield from LP fees and lending idle USDC. Users can exit with their proportional share of assets. A 10% performance fee on profits goes to locked BAAL-ETH LP providers.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "dotenv": "^16.4.7",
+    "hardhat": "^2.22.19"
+  }
+}
