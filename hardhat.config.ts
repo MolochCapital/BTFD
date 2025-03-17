@@ -9,11 +9,11 @@ const config: HardhatUserConfig = {
   defaultNetwork: 'mantleSepolia', // chosen by default when network isn't specified while running Hardhat
   networks: {
     mantle: {
-      url: 'https://rpc.mantle.xyz', //mainnet
+      url: 'https://rpc.mantle.xyz', // Original mainnet RPC
       accounts: [process.env.ACCOUNT_PRIVATE_KEY ?? ''],
     },
     mantleSepolia: {
-      url: 'https://rpc.sepolia.mantle.xyz', // Sepolia Testnet
+      url: 'https://rpc.sepolia.mantle.xyz', // Original Sepolia testnet RPC
       accounts: [process.env.ACCOUNT_PRIVATE_KEY ?? ''],
       gasPrice: 20000000,
     },
