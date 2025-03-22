@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
 interface IComet {
@@ -29,15 +30,23 @@ interface IUniswapRouter {
 
 interface INAVOracle {
     function triggerUpdate() external;
+    function getCbBTCPrice() external view returns (uint256);
+}
+
+interface IBTFD {
+    function totalAssets() external view returns (uint256);
 }
 
 /**
  * @title LeverageManager
- * @notice Manages leveraged positions using Compound v3
+ * @notice Manages leveraged positions using Compound v3 for the BTFD vault on Base
+ * @dev Leveraging occurs ONLY on deposit - no automatic rebalancing is performed
  */
 contract LeverageManager is Ownable, ReentrancyGuard {
-    // Treasury (Gnosis Safe)
-    address public treasury;
+    using SafeERC20 for IERC20;
+    
+    // BTFD Vault (ERC-4626 compliant)
+    address public btfdVault;
     // Compound v3 Comet contract
     address public compoundComet;
     // NAV Oracle
@@ -46,8 +55,8 @@ contract LeverageManager is Ownable, ReentrancyGuard {
     address public uniswapRouter;
     
     // Token addresses
-    address public fbtcToken;
-    address public usdeToken;
+    address public cbBTCToken;
+    address public usdcToken;
     
     // Target Loan-to-Value ratio (in basis points, e.g. 6500 = 65%)
     uint256 public targetLTV;
@@ -64,21 +73,22 @@ contract LeverageManager is Ownable, ReentrancyGuard {
     event PositionLeveraged(uint256 collateralAmount, uint256 borrowAmount, uint256 newLTV);
     event PositionDeleveraged(uint256 repaidAmount, uint256 collateralReduced, uint256 newLTV);
     event LTVAdjusted(uint256 oldLTV, uint256 newLTV);
+    event ExitPrepared(uint256 sharePercentage, uint256 cbBTCReturned);
     
     constructor(
-        address _treasury,
+        address _btfdVault,
         address _compoundComet,
         address _navOracle,
         address _uniswapRouter,
-        address _fbtcToken,
-        address _usdeToken
+        address _cbBTCToken,
+        address _usdcToken
     ) Ownable(msg.sender) {
-        treasury = _treasury;
+        btfdVault = _btfdVault;
         compoundComet = _compoundComet;
         navOracle = _navOracle;
         uniswapRouter = _uniswapRouter;
-        fbtcToken = _fbtcToken;
-        usdeToken = _usdeToken;
+        cbBTCToken = _cbBTCToken;
+        usdcToken = _usdcToken;
         
         targetLTV = 6500; // 65%
         maxLTV = 7500; // 75%
@@ -88,12 +98,12 @@ contract LeverageManager is Ownable, ReentrancyGuard {
     
     /**
      * @notice Get current position details
-     * @return suppliedAmount Amount of FBTC supplied as collateral
-     * @return borrowedAmount Amount of USDe borrowed
+     * @return suppliedAmount Amount of cbBTC supplied as collateral
+     * @return borrowedAmount Amount of USDC borrowed
      */
     function getPositionDetails() external view returns (uint256 suppliedAmount, uint256 borrowedAmount) {
-        suppliedAmount = IComet(compoundComet).collateralBalanceOf(treasury, fbtcToken);
-        borrowedAmount = IComet(compoundComet).borrowBalanceOf(treasury);
+        suppliedAmount = IComet(compoundComet).collateralBalanceOf(btfdVault, cbBTCToken);
+        borrowedAmount = IComet(compoundComet).borrowBalanceOf(btfdVault);
         return (suppliedAmount, borrowedAmount);
     }
     
@@ -102,35 +112,34 @@ contract LeverageManager is Ownable, ReentrancyGuard {
      * @return LTV in basis points
      */
     function getCurrentLTV() public view returns (uint256) {
-        uint256 collateralValue = IComet(compoundComet).collateralBalanceOf(treasury, fbtcToken);
-        uint256 borrowedAmount = IComet(compoundComet).borrowBalanceOf(treasury);
+        uint256 collateralValue = IComet(compoundComet).collateralBalanceOf(btfdVault, cbBTCToken);
+        uint256 borrowedAmount = IComet(compoundComet).borrowBalanceOf(btfdVault);
         
         if (collateralValue == 0) {
             return 0;
         }
         
-        // Get price of FBTC in USDe
-        // This is simplified - would need an actual price oracle
-        uint256 fbtcPrice = 80000 * 1e18; // Example: 80k USDe per FBTC
+        // Get price of cbBTC in USDC from the oracle
+        uint256 cbBTCPrice = INAVOracle(navOracle).getCbBTCPrice();
         
-        uint256 collateralValueInUSDe = collateralValue * fbtcPrice / 1e18;
-        return borrowedAmount * 10000 / collateralValueInUSDe;
+        uint256 collateralValueInUSDC = collateralValue * cbBTCPrice / 1e18;
+        return borrowedAmount * 10000 / collateralValueInUSDC;
     }
     
     /**
-     * @notice Handle new deposit by adjusting leverage
-     * @param newCollateralAmount Amount of new FBTC collateral
+     * @notice Handle new deposit by applying leverage ONCE at entry
+     * @param amount Amount of new cbBTC collateral
      */
-    function onDeposit(uint256 newCollateralAmount) external nonReentrant {
-        // Only treasury can call this
-        require(msg.sender == treasury, "Only treasury can call");
+    function onDeposit(uint256 amount) external nonReentrant {
+        // Only vault can call this
+        require(msg.sender == btfdVault, "Only vault can call");
         
         // Supply new collateral to Compound
-        IERC20(fbtcToken).transferFrom(treasury, address(this), newCollateralAmount);
-        IERC20(fbtcToken).approve(compoundComet, newCollateralAmount);
-        IComet(compoundComet).supplyTo(treasury, fbtcToken, newCollateralAmount);
+        IERC20(cbBTCToken).safeTransferFrom(btfdVault, address(this), amount);
+        IERC20(cbBTCToken).safeApprove(compoundComet, amount);
+        IComet(compoundComet).supplyTo(btfdVault, cbBTCToken, amount);
         
-        // Adjust leverage to target LTV
+        // Apply leverage once at entry to target LTV
         _adjustLeverage();
         
         // Update NAV
@@ -140,98 +149,101 @@ contract LeverageManager is Ownable, ReentrancyGuard {
     /**
      * @notice Prepare exit by unwinding part of leverage
      * @param sharePercentage Percentage of total to exit (in basis points)
-     * @return fbtcAmount Amount of FBTC released for exit
+     * @return cbBTCAmount Amount of cbBTC released for exit
      */
-    function prepareExit(uint256 sharePercentage) external nonReentrant returns (uint256 fbtcAmount) {
-        // Only treasury can call this
-        require(msg.sender == treasury, "Only treasury can call");
+    function prepareExit(uint256 sharePercentage) external nonReentrant returns (uint256 cbBTCAmount) {
+        // Only vault can call this
+        require(msg.sender == btfdVault, "Only vault can call");
         require(sharePercentage > 0 && sharePercentage <= 10000, "Invalid percentage");
         
         // Get current position
-        uint256 totalCollateral = IComet(compoundComet).collateralBalanceOf(treasury, fbtcToken);
-        uint256 totalBorrowed = IComet(compoundComet).borrowBalanceOf(treasury);
+        uint256 totalCollateral = IComet(compoundComet).collateralBalanceOf(btfdVault, cbBTCToken);
+        uint256 totalBorrowed = IComet(compoundComet).borrowBalanceOf(btfdVault);
         
         // Calculate amounts to unwind
         uint256 collateralToWithdraw = totalCollateral * sharePercentage / 10000;
         uint256 debtToRepay = totalBorrowed * sharePercentage / 10000;
         
-        // Repay portion of debt
-        // First get USDe (either from treasury or by swapping FBTC)
-        if (IERC20(usdeToken).balanceOf(treasury) >= debtToRepay) {
-            // If treasury has enough USDe, use that
-            IERC20(usdeToken).transferFrom(treasury, address(this), debtToRepay);
-        } else {
-            // Otherwise, withdraw some FBTC and swap for USDe
-            uint256 fbtcToSwap = _calculateFbtcToSwapForUsde(debtToRepay);
+        // If there's no position to unwind
+        if (totalCollateral == 0 || totalBorrowed == 0) {
+            return 0;
+        }
+        
+        // First, withdraw cbBTC from Compound to handle the debt repayment
+        uint256 cbBTCToSwap = _calculateCbBTCToSwapForUSDC(debtToRepay);
+        
+        // Make sure we don't try to withdraw more than we have
+        cbBTCToSwap = cbBTCToSwap > collateralToWithdraw ? collateralToWithdraw : cbBTCToSwap;
+        
+        if (cbBTCToSwap > 0) {
+            // Withdraw cbBTC from Compound
+            IComet(compoundComet).withdrawTo(address(this), cbBTCToken, cbBTCToSwap);
             
-            // Withdraw FBTC from Compound
-            IComet(compoundComet).withdrawTo(address(this), fbtcToken, fbtcToSwap);
+            // Swap cbBTC for USDC
+            IERC20(cbBTCToken).safeApprove(uniswapRouter, cbBTCToSwap);
+            uint256 minUSDC = debtToRepay * (10000 - slippageTolerance) / 10000; // Account for slippage
             
-            // Swap FBTC for USDe
-            IERC20(fbtcToken).approve(uniswapRouter, fbtcToSwap);
-            uint256 minUsDe = debtToRepay * (10000 - slippageTolerance) / 10000; // Account for slippage
-            
-            uint256 receivedUSDe = IUniswapRouter(uniswapRouter).exactInputSingle(
-                fbtcToken,
-                usdeToken,
+            uint256 receivedUSDC = IUniswapRouter(uniswapRouter).exactInputSingle(
+                cbBTCToken,
+                usdcToken,
                 uniswapFeeTier,
                 address(this),
-                fbtcToSwap,
-                minUsDe,
+                cbBTCToSwap,
+                minUSDC,
                 0 // No price limit
             );
             
-            require(receivedUSDe >= debtToRepay, "Swap didn't yield enough USDe");
+            // Repay debt to Compound
+            IERC20(usdcToken).safeApprove(compoundComet, receivedUSDC);
+            IComet(compoundComet).supply(usdcToken, receivedUSDC);
             
             // Reduce collateral to withdraw by the amount swapped
-            collateralToWithdraw = collateralToWithdraw > fbtcToSwap ? 
-                                   collateralToWithdraw - fbtcToSwap : 0;
+            collateralToWithdraw = collateralToWithdraw > cbBTCToSwap ? 
+                                   collateralToWithdraw - cbBTCToSwap : 0;
         }
         
-        // Repay debt to Compound
-        IERC20(usdeToken).approve(compoundComet, debtToRepay);
-        IComet(compoundComet).supply(usdeToken, debtToRepay);
-        
-        // Withdraw remaining collateral
+        // Withdraw remaining collateral directly to the vault
         if (collateralToWithdraw > 0) {
-            IComet(compoundComet).withdrawTo(treasury, fbtcToken, collateralToWithdraw);
-            fbtcAmount = collateralToWithdraw;
+            IComet(compoundComet).withdrawTo(btfdVault, cbBTCToken, collateralToWithdraw);
+            cbBTCAmount = collateralToWithdraw;
         }
         
         // Update NAV
         INAVOracle(navOracle).triggerUpdate();
         
-        return fbtcAmount;
+        emit ExitPrepared(sharePercentage, cbBTCAmount);
+        
+        return cbBTCAmount;
     }
     
     /**
-     * @notice Calculate how much FBTC to swap to get a target amount of USDe
-     * @param usdeAmount Target USDe amount
-     * @return Amount of FBTC to swap
+     * @notice Calculate how much cbBTC to swap to get a target amount of USDC
+     * @param usdcAmount Target USDC amount
+     * @return Amount of cbBTC to swap
      */
-    function _calculateFbtcToSwapForUsde(uint256 usdeAmount) internal view returns (uint256) {
-        // Get price of FBTC in USDe
-        // This is simplified - would need an actual price oracle
-        uint256 fbtcPrice = 80000 * 1e18; // Example: 80k USDe per FBTC
+    function _calculateCbBTCToSwapForUSDC(uint256 usdcAmount) internal view returns (uint256) {
+        // Get price of cbBTC in USDC from the oracle
+        uint256 cbBTCPrice = INAVOracle(navOracle).getCbBTCPrice();
         
-        // Add some buffer for slippage and fees (e.g., 2%)
-        uint256 buffer = 200;
+        // Add some buffer for slippage and fees
+        uint256 buffer = slippageTolerance * 2; // Double the slippage tolerance for safety
         
-        // Calculate FBTC amount needed
-        return usdeAmount * (10000 + buffer) / 10000 * 1e18 / fbtcPrice;
+        // Calculate cbBTC amount needed
+        return usdcAmount * (10000 + buffer) / 10000 * 1e18 / cbBTCPrice;
     }
     
     /**
-     * @notice Adjust leverage to maintain target LTV
+     * @notice Apply leverage to the position at entry
+     * @dev This only happens once when assets are deposited, not continuously
      */
-    function _adjustLeverage() internal {
+    function _applyEntryLeverage() internal {
         uint256 currentLTV = getCurrentLTV();
         
         if (currentLTV < targetLTV) {
             // Leverage up: borrow more
             _leverageUp();
         } else if (currentLTV > maxLTV) {
-            // Deleverage: repay some debt
+            // If LTV is too high (unlikely on entry), deleverage
             _deleverageDown();
         }
         
@@ -244,46 +256,45 @@ contract LeverageManager is Ownable, ReentrancyGuard {
      */
     function _leverageUp() internal {
         // Get current position
-        uint256 collateralValue = IComet(compoundComet).collateralBalanceOf(treasury, fbtcToken);
-        uint256 currentBorrowed = IComet(compoundComet).borrowBalanceOf(treasury);
+        uint256 collateralValue = IComet(compoundComet).collateralBalanceOf(btfdVault, cbBTCToken);
+        uint256 currentBorrowed = IComet(compoundComet).borrowBalanceOf(btfdVault);
         
-        // Get price of FBTC in USDe
-        // This is simplified - would need an actual price oracle
-        uint256 fbtcPrice = 80000 * 1e18; // Example: 80k USDe per FBTC
+        // Get price of cbBTC in USDC
+        uint256 cbBTCPrice = INAVOracle(navOracle).getCbBTCPrice();
         
-        uint256 collateralValueInUSDe = collateralValue * fbtcPrice / 1e18;
+        uint256 collateralValueInUSDC = collateralValue * cbBTCPrice / 1e18;
         
         // Calculate how much more to borrow to reach target LTV
-        uint256 targetBorrow = collateralValueInUSDe * targetLTV / 10000;
+        uint256 targetBorrow = collateralValueInUSDC * targetLTV / 10000;
         uint256 additionalBorrow = targetBorrow > currentBorrowed ? 
                                  targetBorrow - currentBorrowed : 0;
         
         if (additionalBorrow > 0) {
-            // Borrow more USDe
+            // Borrow more USDC
             IComet(compoundComet).borrow(additionalBorrow);
             
-            // Swap USDe for more FBTC
-            IERC20(usdeToken).approve(uniswapRouter, additionalBorrow);
+            // Swap USDC for more cbBTC
+            IERC20(usdcToken).safeApprove(uniswapRouter, additionalBorrow);
             
-            // Calculate minimum FBTC expected (accounting for slippage)
-            uint256 expectedFbtc = additionalBorrow * 1e18 / fbtcPrice;
-            uint256 minFbtc = expectedFbtc * (10000 - slippageTolerance) / 10000;
+            // Calculate minimum cbBTC expected (accounting for slippage)
+            uint256 expectedCbBTC = additionalBorrow * 1e18 / cbBTCPrice;
+            uint256 minCbBTC = expectedCbBTC * (10000 - slippageTolerance) / 10000;
             
-            uint256 receivedFBTC = IUniswapRouter(uniswapRouter).exactInputSingle(
-                usdeToken,
-                fbtcToken,
+            uint256 receivedCbBTC = IUniswapRouter(uniswapRouter).exactInputSingle(
+                usdcToken,
+                cbBTCToken,
                 uniswapFeeTier,
                 address(this),
                 additionalBorrow,
-                minFbtc,
+                minCbBTC,
                 0 // No price limit
             );
             
-            // Supply new FBTC as collateral
-            IERC20(fbtcToken).approve(compoundComet, receivedFBTC);
-            IComet(compoundComet).supplyTo(treasury, fbtcToken, receivedFBTC);
+            // Supply new cbBTC as collateral
+            IERC20(cbBTCToken).safeApprove(compoundComet, receivedCbBTC);
+            IComet(compoundComet).supplyTo(btfdVault, cbBTCToken, receivedCbBTC);
             
-            emit PositionLeveraged(receivedFBTC, additionalBorrow, getCurrentLTV());
+            emit PositionLeveraged(receivedCbBTC, additionalBorrow, getCurrentLTV());
         }
     }
     
@@ -298,61 +309,76 @@ contract LeverageManager is Ownable, ReentrancyGuard {
         }
         
         // Get current position
-        uint256 collateralValue = IComet(compoundComet).collateralBalanceOf(treasury, fbtcToken);
-        uint256 currentBorrowed = IComet(compoundComet).borrowBalanceOf(treasury);
+        uint256 collateralValue = IComet(compoundComet).collateralBalanceOf(btfdVault, cbBTCToken);
+        uint256 currentBorrowed = IComet(compoundComet).borrowBalanceOf(btfdVault);
         
-        // Get price of FBTC in USDe
-        // This is simplified - would need an actual price oracle
-        uint256 fbtcPrice = 80000 * 1e18; // Example: 80k USDe per FBTC
+        // Get price of cbBTC in USDC
+        uint256 cbBTCPrice = INAVOracle(navOracle).getCbBTCPrice();
         
-        uint256 collateralValueInUSDe = collateralValue * fbtcPrice / 1e18;
+        uint256 collateralValueInUSDC = collateralValue * cbBTCPrice / 1e18;
         
         // Calculate how much debt to repay to reach target LTV
-        uint256 targetBorrow = collateralValueInUSDe * targetLTV / 10000;
+        uint256 targetBorrow = collateralValueInUSDC * targetLTV / 10000;
         uint256 amountToRepay = currentBorrowed > targetBorrow ? 
                               currentBorrowed - targetBorrow : 0;
         
         if (amountToRepay > 0) {
-            // Calculate FBTC to sell
-            uint256 fbtcToSell = _calculateFbtcToSwapForUsde(amountToRepay);
+            // Calculate cbBTC to sell
+            uint256 cbBTCToSell = _calculateCbBTCToSwapForUSDC(amountToRepay);
             
-            // Withdraw FBTC from Compound
-            IComet(compoundComet).withdrawTo(address(this), fbtcToken, fbtcToSell);
+            // Withdraw cbBTC from Compound
+            IComet(compoundComet).withdrawTo(address(this), cbBTCToken, cbBTCToSell);
             
-            // Swap FBTC for USDe
-            IERC20(fbtcToken).approve(uniswapRouter, fbtcToSell);
-            uint256 minUsDe = amountToRepay * (10000 - slippageTolerance) / 10000;
+            // Swap cbBTC for USDC
+            IERC20(cbBTCToken).safeApprove(uniswapRouter, cbBTCToSell);
+            uint256 minUSDC = amountToRepay * (10000 - slippageTolerance) / 10000;
             
-            uint256 receivedUSDe = IUniswapRouter(uniswapRouter).exactInputSingle(
-                fbtcToken,
-                usdeToken,
+            uint256 receivedUSDC = IUniswapRouter(uniswapRouter).exactInputSingle(
+                cbBTCToken,
+                usdcToken,
                 uniswapFeeTier,
                 address(this),
-                fbtcToSell,
-                minUsDe,
+                cbBTCToSell,
+                minUSDC,
                 0 // No price limit
             );
             
             // Repay debt
-            IERC20(usdeToken).approve(compoundComet, receivedUSDe);
-            IComet(compoundComet).supply(usdeToken, receivedUSDe);
+            IERC20(usdcToken).safeApprove(compoundComet, receivedUSDC);
+            IComet(compoundComet).supply(usdcToken, receivedUSDC);
             
-            emit PositionDeleveraged(receivedUSDe, fbtcToSell, getCurrentLTV());
+            emit PositionDeleveraged(receivedUSDC, cbBTCToSell, getCurrentLTV());
         }
     }
     
     /**
-     * @notice Manually trigger leverage adjustment
-     * @dev Can be called by treasury or owner
+     * @notice Manual rebalance function - not used in normal operation
+     * @dev Can be called by vault or owner for emergency situations only
      */
     function rebalance() external {
-        require(msg.sender == treasury || msg.sender == owner(), "Unauthorized");
+        require(msg.sender == btfdVault || msg.sender == owner(), "Unauthorized");
         
         uint256 oldLTV = getCurrentLTV();
-        _adjustLeverage();
+        _applyEntryLeverage();
         uint256 newLTV = getCurrentLTV();
         
         emit LTVAdjusted(oldLTV, newLTV);
+    }
+    
+    /**
+     * @notice Get the current health factor of the position
+     * @return Health factor in percentage (10000 = 100%)
+     */
+    function getHealthFactor() external view returns (uint256) {
+        uint256 currentLTV = getCurrentLTV();
+        if (currentLTV == 0) return type(uint256).max; // No debt = infinite health
+        
+        // Calculate how much room we have before max LTV (higher is better)
+        uint256 liquidationLTV = 8500; // Assuming Compound liquidation starts at 85% LTV
+        
+        if (currentLTV >= liquidationLTV) return 0; // Already liquidatable
+        
+        return (liquidationLTV - currentLTV) * 10000 / currentLTV;
     }
     
     /**
@@ -392,34 +418,34 @@ contract LeverageManager is Ownable, ReentrancyGuard {
     
     /**
      * @notice Update contract addresses
-     * @param _treasury New treasury address
+     * @param _btfdVault New vault address
      * @param _compoundComet New Compound Comet address
      * @param _navOracle New NAV oracle address
      * @param _uniswapRouter New Uniswap router address
      */
     function updateAddresses(
-        address _treasury,
+        address _btfdVault,
         address _compoundComet,
         address _navOracle,
         address _uniswapRouter
     ) external onlyOwner {
-        treasury = _treasury;
-        compoundComet = _compoundComet;
-        navOracle = _navOracle;
-        uniswapRouter = _uniswapRouter;
+        if (_btfdVault != address(0)) btfdVault = _btfdVault;
+        if (_compoundComet != address(0)) compoundComet = _compoundComet;
+        if (_navOracle != address(0)) navOracle = _navOracle;
+        if (_uniswapRouter != address(0)) uniswapRouter = _uniswapRouter;
     }
     
     /**
      * @notice Update token addresses
-     * @param _fbtcToken New FBTC token address
-     * @param _usdeToken New USDe token address
+     * @param _cbBTCToken New cbBTC token address
+     * @param _usdcToken New USDC token address
      */
     function updateTokenAddresses(
-        address _fbtcToken,
-        address _usdeToken
+        address _cbBTCToken,
+        address _usdcToken
     ) external onlyOwner {
-        fbtcToken = _fbtcToken;
-        usdeToken = _usdeToken;
+        if (_cbBTCToken != address(0)) cbBTCToken = _cbBTCToken;
+        if (_usdcToken != address(0)) usdcToken = _usdcToken;
     }
     
     /**
@@ -427,14 +453,36 @@ contract LeverageManager is Ownable, ReentrancyGuard {
      * @dev Only owner can call this
      */
     function emergencyWithdraw() external onlyOwner {
-        uint256 fbtcBalance = IERC20(fbtcToken).balanceOf(address(this));
-        if (fbtcBalance > 0) {
-            IERC20(fbtcToken).transfer(treasury, fbtcBalance);
+        uint256 cbBTCBalance = IERC20(cbBTCToken).balanceOf(address(this));
+        if (cbBTCBalance > 0) {
+            IERC20(cbBTCToken).safeTransfer(btfdVault, cbBTCBalance);
         }
         
-        uint256 usdeBalance = IERC20(usdeToken).balanceOf(address(this));
-        if (usdeBalance > 0) {
-            IERC20(usdeToken).transfer(treasury, usdeBalance);
+        uint256 usdcBalance = IERC20(usdcToken).balanceOf(address(this));
+        if (usdcBalance > 0) {
+            IERC20(usdcToken).safeTransfer(btfdVault, usdcBalance);
         }
+    }
+    
+    /**
+     * @notice Emergency function to force deleverage in extreme market conditions
+     * @param targetLTVBps Target LTV in basis points to reduce to
+     */
+    function emergencyDeleverage(uint256 targetLTVBps) external onlyOwner {
+        require(targetLTVBps < getCurrentLTV(), "Target must be lower than current LTV");
+        
+        uint256 oldLTV = getCurrentLTV();
+        uint256 oldTargetLTV = targetLTV;
+        
+        // Temporarily set target LTV to the emergency target
+        targetLTV = targetLTVBps;
+        
+        // Force deleverage
+        _deleverageDown();
+        
+        // Restore original target
+        targetLTV = oldTargetLTV;
+        
+        emit LTVAdjusted(oldLTV, getCurrentLTV());
     }
 }
