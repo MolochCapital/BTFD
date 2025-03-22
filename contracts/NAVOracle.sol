@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/extensions/IERC4626.sol";
+import "@openzeppelin/contracts/interfaces/IERC4626.sol";
 
 interface IPriceOracle {
     function getCbBTCPrice() external view returns (uint256);

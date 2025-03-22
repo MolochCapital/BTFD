@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 interface IComet {
     function supply(address asset, uint256 amount) external;
@@ -136,11 +136,11 @@ contract LeverageManager is Ownable, ReentrancyGuard {
         
         // Supply new collateral to Compound
         IERC20(cbBTCToken).safeTransferFrom(btfdVault, address(this), amount);
-        IERC20(cbBTCToken).safeApprove(compoundComet, amount);
+        IERC20(cbBTCToken).approve(compoundComet, amount);
         IComet(compoundComet).supplyTo(btfdVault, cbBTCToken, amount);
         
         // Apply leverage once at entry to target LTV
-        _adjustLeverage();
+        _applyEntryLeverage();
         
         // Update NAV
         INAVOracle(navOracle).triggerUpdate();
@@ -180,7 +180,7 @@ contract LeverageManager is Ownable, ReentrancyGuard {
             IComet(compoundComet).withdrawTo(address(this), cbBTCToken, cbBTCToSwap);
             
             // Swap cbBTC for USDC
-            IERC20(cbBTCToken).safeApprove(uniswapRouter, cbBTCToSwap);
+            IERC20(cbBTCToken).approve(uniswapRouter, cbBTCToSwap);
             uint256 minUSDC = debtToRepay * (10000 - slippageTolerance) / 10000; // Account for slippage
             
             uint256 receivedUSDC = IUniswapRouter(uniswapRouter).exactInputSingle(
@@ -194,7 +194,7 @@ contract LeverageManager is Ownable, ReentrancyGuard {
             );
             
             // Repay debt to Compound
-            IERC20(usdcToken).safeApprove(compoundComet, receivedUSDC);
+            IERC20(usdcToken).approve(compoundComet, receivedUSDC);
             IComet(compoundComet).supply(usdcToken, receivedUSDC);
             
             // Reduce collateral to withdraw by the amount swapped
@@ -274,7 +274,7 @@ contract LeverageManager is Ownable, ReentrancyGuard {
             IComet(compoundComet).borrow(additionalBorrow);
             
             // Swap USDC for more cbBTC
-            IERC20(usdcToken).safeApprove(uniswapRouter, additionalBorrow);
+            IERC20(usdcToken).approve(uniswapRouter, additionalBorrow);
             
             // Calculate minimum cbBTC expected (accounting for slippage)
             uint256 expectedCbBTC = additionalBorrow * 1e18 / cbBTCPrice;
@@ -291,7 +291,7 @@ contract LeverageManager is Ownable, ReentrancyGuard {
             );
             
             // Supply new cbBTC as collateral
-            IERC20(cbBTCToken).safeApprove(compoundComet, receivedCbBTC);
+            IERC20(cbBTCToken).approve(compoundComet, receivedCbBTC);
             IComet(compoundComet).supplyTo(btfdVault, cbBTCToken, receivedCbBTC);
             
             emit PositionLeveraged(receivedCbBTC, additionalBorrow, getCurrentLTV());
@@ -330,7 +330,7 @@ contract LeverageManager is Ownable, ReentrancyGuard {
             IComet(compoundComet).withdrawTo(address(this), cbBTCToken, cbBTCToSell);
             
             // Swap cbBTC for USDC
-            IERC20(cbBTCToken).safeApprove(uniswapRouter, cbBTCToSell);
+            IERC20(cbBTCToken).approve(uniswapRouter, cbBTCToSell);
             uint256 minUSDC = amountToRepay * (10000 - slippageTolerance) / 10000;
             
             uint256 receivedUSDC = IUniswapRouter(uniswapRouter).exactInputSingle(
@@ -344,7 +344,7 @@ contract LeverageManager is Ownable, ReentrancyGuard {
             );
             
             // Repay debt
-            IERC20(usdcToken).safeApprove(compoundComet, receivedUSDC);
+            IERC20(usdcToken).approve(compoundComet, receivedUSDC);
             IComet(compoundComet).supply(usdcToken, receivedUSDC);
             
             emit PositionDeleveraged(receivedUSDC, cbBTCToSell, getCurrentLTV());

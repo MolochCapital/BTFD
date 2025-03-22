@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
 /**
@@ -322,7 +322,7 @@ contract BTFD is ERC4626, Ownable, ReentrancyGuard {
      */
     function _deployToStrategy(uint256 amount) internal {
         // Approve leverage manager to take tokens
-        IERC20(asset()).safeApprove(address(leverageManager), amount);
+        IERC20(asset()).approve(address(leverageManager), amount);
         
         // Send to leverage manager - this will lever up the position ONCE at entry
         leverageManager.onDeposit(amount);
@@ -494,8 +494,8 @@ contract BTFD is ERC4626, Ownable, ReentrancyGuard {
         IERC20(token).safeTransfer(to, amount);
     }
 
-    function convertToShares(uint256 assets) public view returns (uint256) {
+    function convertToShares(uint256 assets) public view override returns (uint256) {
         uint256 supply = totalSupply();
-        return supply == 0 ? assets : assets.mulDivDown(supply, totalAssets());
+        return supply == 0 ? assets : (assets * supply) / totalAssets();
     }
 }

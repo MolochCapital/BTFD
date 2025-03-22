@@ -13,7 +13,7 @@ pragma solidity ^0.8.24;
  */
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
 // Uniswap V3 interfaces
@@ -315,24 +315,34 @@ contract StrikePriceHook is ReentrancyGuard, Ownable {
      * @return sqrtPriceX96 value
      */
     function getSqrtRatioAtTick(int24 tick) internal pure returns (uint160) {
-        // This is a simplified version of the calculation
-        // In a real implementation, you would use TickMath.getSqrtRatioAtTick from the Uniswap SDK
-        uint256 absTick = tick < 0 ? uint256(-int256(tick)) : uint256(int256(tick));
-        require(absTick <= uint256(int256(887272)), "Tick out of range");
+        // This is a simplified implementation based on the Uniswap V3 tick math
+        // In production, you should import the TickMath library from Uniswap
+        uint256 absTick = tick < 0 ? uint256(uint24(-tick)) : uint256(uint24(tick));
+        require(absTick <= 887272, "Tick out of range");
         
-        // This is a crude approximation - in production, use the actual formula from Uniswap SDK
-        uint160 baseValue = 1 << 96;  // 2^96
+        // Start with the base value (1 in Q96 format)
+        uint256 ratio = 1 << 96;
         
-        // Each tick represents ~0.01% price change
-        uint256 factor = 1e18;
-        if (tick > 0) {
-            factor = (1.0001 ** uint256(tick)) * 1e18;
-        } else if (tick < 0) {
-            factor = 1e18 * 1e18 / ((1.0001 ** uint256(-tick)) * 1e18);
+        // Using bit shifts and integer math to approximate the 1.0001^tick calculation
+        // Each power of 2 tick value is precomputed
+        
+        // Apply powers of 1.0001 using bitwise operations
+        if (absTick & 0x1 != 0) ratio = (ratio * 1000100000000000000) / 1000000000000000000;
+        if (absTick & 0x2 != 0) ratio = (ratio * 1000200010000000000) / 1000000000000000000;
+        if (absTick & 0x4 != 0) ratio = (ratio * 1000400060004000000) / 1000000000000000000;
+        if (absTick & 0x8 != 0) ratio = (ratio * 1000800240030008000) / 1000000000000000000;
+        if (absTick & 0x10 != 0) ratio = (ratio * 1001601281024016000) / 1000000000000000000;
+        if (absTick & 0x20 != 0) ratio = (ratio * 1003210121826557120) / 1000000000000000000;
+        // Add more bit shifts for higher powers if needed
+        
+        // Invert the ratio if tick is negative
+        if (tick < 0) {
+            ratio = (1 << 192) / ratio;
         }
         
-        uint160 sqrtPriceX96 = uint160((baseValue * uint256(factor)) / 1e18);
-        return sqrtPriceX96;
+        // Ensure the result fits in uint160
+        require(ratio <= type(uint160).max, "Ratio overflow");
+        return uint160(ratio);
     }
     
     //----------------------------------------------------------------
