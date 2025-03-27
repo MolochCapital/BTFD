@@ -7,33 +7,21 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
 /**
- * @title BTFD - Cooperative Leverage Trading Vault
- * @notice ERC-4626 compliant vault implementing a "Buy The Dip" strategy with leverage
+ * @title Moloch Capital - A Cooperative Leverage Long cbBTC Vault
+ *  
+ * 1. Users deposit USDC into a USDC / cbBTC Univ3 pool, and set a "Strike Price" lower range for their position. When the strike price is hit, the cbBTC from the LP is pulled and deposited into the Vault -- providing the user with equity shares.
  * 
- * This system enables:
- * 1. Cooperative leveraged positions - users deposit cbBTC which is then leveraged through Compound III
- *    Later entrants at lower prices effectively improve the position for all participants
+ * 2. The Vault runs a strategy where the deposited cbBTC is supplied as collateral to Compound III, and USDC is borrowed against it to a 69% LTV. More cbBTC is purchased with the borrowed USDC, forming a levered long. When the LTV is below 69%, more leverage is added to the position, and when the LTV is above 69%, new collateral deposits are added to the position.
  * 
- * 2. Strike price based entry system - users can set price targets at which their USDC is 
- *    automatically converted to cbBTC and added to the position, implementing automated DCA
+ * 3. The NAV of the vault, is determined by the value of the cbBTC held in the Vault, minus the USDC Debt. Shares represent equity over the PnL of the Vault, so users are competing for more equity, and collaborating to navigate the risk of the position.
  * 
- * 3. Individual profit tracking - each user's entry price is recorded to enable accurate 
- *    performance fee calculation based on their specific gains, not collective vault performance
+ * 4. Individual positions are tracked in addition to the vault's NAV, and users are free to exit at any time. When users exit, only their portion of the leveraged position is unwound, maintaining the remaining position for other users.
  * 
- * 4. Collective benefit mechanism - performance fees remain in the vault to benefit remaining 
- *    participants, creating incentive for long-term participation
+ * 5. A performance fee of 6.9% is charged on profits of all user exits. This fee remains in the vault to benefit remaining users.
  * 
- * 5. Proportional unwinding - when users exit, only their portion of the leveraged position is
- *    unwound, maintaining position integrity for remaining users
- * 
- * The contract uses a leveraged strategy where cbBTC is supplied as collateral to Compound III, 
- * USDC is borrowed against it, converted to more cbBTC, and supplied again as additional collateral.
  */
 
-/**
- * @dev Interface for interacting with the LeverageManager contract that handles
- * all Compound III interactions and leverage operations
- */
+// Interface ILeverageManager handles all Compound III interactions and leverage operations.
 interface ILeverageManager {
     /**
      * @notice Handles new deposits by applying leverage to the collateral
@@ -56,9 +44,7 @@ interface ILeverageManager {
     function getPositionDetails() external view returns (uint256 suppliedAmount, uint256 borrowedAmount);
 }
 
-/**
- * @dev Interface for the price oracle that provides the cbBTC/USDC exchange rate
- */
+// Interface IPriceOracle provides the cbBTC/USDC price data.
 interface IPriceOracle {
     /**
      * @notice Gets the current price of cbBTC in USDC
@@ -67,9 +53,7 @@ interface IPriceOracle {
     function getCbBTCPrice() external view returns (uint256);
 }
 
-/**
- * @dev Interface for the StrikePriceHook that monitors prices and triggers conversions
- */
+// Interface IStrikePriceHook monitors prices and triggers conversions.
 interface IStrikePriceHook {
     /**
      * @notice Checks current prices against user-set strike prices and executes conversions
@@ -77,12 +61,7 @@ interface IStrikePriceHook {
     function checkAndTriggerStrikes() external;
 }
 
-/**
- * @title BTFD
- * @notice Main vault contract implementing ERC-4626 standard for a leveraged Bitcoin strategy
- * @dev Inherits ERC4626 for standard vault functionality, Ownable for admin functions,
- *      and ReentrancyGuard for protection against reentrancy attacks
- */
+// BTFD is a leveraged Bitcoin strategy vault that implements ERC-4626 standard for a leveraged Bitcoin strategy
 contract BTFD is ERC4626, Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -90,128 +69,70 @@ contract BTFD is ERC4626, Ownable, ReentrancyGuard {
     // STATE VARIABLES
     //----------------------------------------------------------------
     
-    /**
-     * @notice The LeverageManager contract that handles all Compound III interactions
-     * @dev Responsible for supplying collateral, borrowing, and managing the leveraged position
-     */
+    // LeverageManager handles all Compound III interactions and leverage operations.
     ILeverageManager public leverageManager;
     
-    /**
-     * @notice The price oracle that provides cbBTC/USDC price data
-     */
+    // IPriceOracle provides the cbBTC/USDC price data.
     IPriceOracle public priceOracle;
     
-    /**
-     * @notice The hook contract that monitors prices and triggers strikes
-     */
+    // IStrikePriceHook monitors prices and triggers conversions.
     IStrikePriceHook public strikeHook;
     
-    /**
-     * @notice Address of the cbBTC token (the underlying asset of the vault)
-     */
+    // cbBTCToken is the address of the cbBTC token (the underlying asset of the vault).
     address public cbBTCToken;
     
-    /**
-     * @notice Address of the USDC token (used for pending deposits and borrowing)
-     */
+    // usdcToken is the address of the USDC token (used for pending deposits and borrowing).
     address public usdcToken;
     
-    /**
-     * @notice Performance fee charged on profits when users withdraw
-     * @dev Expressed in basis points (e.g., 500 = 5%)
-     * The fee is calculated only on profits (current value - entry value)
-     * and remains in the vault to benefit remaining participants
-     */
+    // performanceFee is the performance fee charged on profits when users withdraw.
     uint256 public performanceFee;
     
-    /**
-     * @notice Records each user's cbBTC price at entry
-     * @dev Used to calculate profits and performance fees accurately
-     * For users who enter multiple times, this stores a weighted average
-     */
-    mapping(address => uint256) public userEntryPrices;
-    
-    /**
-     * @notice Records the number of shares each user holds at their entry
-     * @dev Used for tracking user positions and calculating weighted averages
-     * on additional deposits
-     */
-    mapping(address => uint256) public userEntryShares;
-    
-    /**
-     * @notice Stores each user's target prices for cbBTC purchases
-     * @dev Price is in USDC per cbBTC (e.g., 60000 = $60,000 per BTC)
-     * When price drops to or below this value, pending USDC is converted
-     */
-    mapping(address => uint256) public strikePoints;
-    
-    /**
-     * @notice Amount of USDC each user has deposited waiting for conversion
-     * @dev When the price hits the strike point, this USDC is converted to cbBTC
-     */
-    mapping(address => uint256) public pendingDeposits;
-    
-    /**
-     * @notice Maximum allowed slippage for swaps in basis points (e.g., 300 = 3%)
-     * @dev Used to prevent excessive slippage in on-chain swaps
-     */
+    // maxSlippage is the maximum allowed slippage for swaps in basis points (e.g., 300 = 3%).
     uint256 public maxSlippage;
     
-    /**
-     * @notice Flag to pause new deposits
-     * @dev Can be set by owner in case of emergencies or contract upgrades
-     */
+    // depositsPaused is a flag to pause new deposits.
     bool public depositsPaused;
     
-    /**
-     * @notice Flag to pause withdrawals
-     * @dev Can be set by owner in case of emergencies or to prevent bank runs
-     */
+    // withdrawalsPaused is a flag to pause withdrawals.
     bool public withdrawalsPaused;
     
-    /**
-     * @notice Emitted when a user sets a strike price
-     * @param user Address of the user setting the strike
-     * @param price The strike price in USDC per cbBTC
-     */
+    //----------------------------------------------------------------  
+    // MAPPINGS
+    //----------------------------------------------------------------
+    
+    // userEntryPrices records each user's cbBTC price at entry.
+    mapping(address => uint256) public userEntryPrices;
+    
+    // userEntryShares records the number of shares each user holds at their entry.
+    mapping(address => uint256) public userEntryShares;
+    
+    // strikePoints stores each user's target prices for cbBTC purchases.
+    mapping(address => uint256) public strikePoints;
+    
+    // pendingDeposits stores the amount of USDC each user has deposited waiting for conversion.
+    mapping(address => uint256) public pendingDeposits;
+    
+    
+    //----------------------------------------------------------------  
+    // EVENTS
+    //----------------------------------------------------------------
+    
+    // StrikePriceSet is an event emitted when a user sets a strike price.
     event StrikePriceSet(address indexed user, uint256 price);
     
-    /**
-     * @notice Emitted when a user adds USDC waiting for a strike
-     * @param user Address of the user making the deposit
-     * @param usdcAmount Amount of USDC deposited
-     */
+    // PendingDepositAdded is an event emitted when a user adds USDC waiting for a strike.
     event PendingDepositAdded(address indexed user, uint256 usdcAmount);
     
-    /**
-     * @notice Emitted when a strike price is hit and conversion occurs
-     * @param user Address of the user whose strike was triggered
-     * @param usdcAmount Amount of USDC converted
-     * @param cbBTCAmount Amount of cbBTC received
-     * @param shares Number of vault shares minted to the user
-     */
+    // StrikeTriggered is an event emitted when a strike price is hit and conversion occurs.
     event StrikeTriggered(address indexed user, uint256 usdcAmount, uint256 cbBTCAmount, uint256 shares);
     
-    /**
-     * @notice Emitted when a performance fee is charged on withdrawal
-     * @param user Address of the user paying the fee
-     * @param cbBTCAmount Amount of fee paid in cbBTC
-     */
+    // PerformanceFeePaid is an event emitted when a performance fee is charged on withdrawal.
     event PerformanceFeePaid(address indexed user, uint256 cbBTCAmount);
     
-    /**
-     * @notice Emitted when a withdrawal is processed
-     * @param user Address of the user withdrawing
-     * @param shares Number of shares redeemed
-     * @param cbBTCAmount Amount of cbBTC returned to the user
-     */
+    // WithdrawalProcessed is an event emitted when a withdrawal is processed.
     event WithdrawalProcessed(address indexed user, uint256 shares, uint256 cbBTCAmount);
     
-    /**
-     * @notice Emitted when performance fees increase the NAV for remaining users
-     * @param feeAmount Amount of fees retained in the vault
-     * @param newNavPerShare New NAV per share after fee retention
-     */
+    // NAVIncreasedFromFees is an event emitted when performance fees increase the NAV for remaining users.
     event NAVIncreasedFromFees(uint256 feeAmount, uint256 newNavPerShare);
     
     //----------------------------------------------------------------
